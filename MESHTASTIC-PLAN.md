@@ -1,9 +1,12 @@
-# WiPhone → Meshtastic node — full build plan
+# WiPhone → Meshtastic node — plan, wire format & engineering log
 
 **Goal:** keep the WiPhone's UI and phone functions (SIP calling, phonebook, Messages
 screen) exactly as they are, and make its LoRa daughterboard speak the **real
 Meshtastic protocol** so it interoperates with a T-Deck and any other Meshtastic node —
 replacing the stock proprietary point-to-point LoRa messaging.
+
+Quickstart, feature list and bring-up checklist live in
+[`README-MESHTASTIC.md`](README-MESHTASTIC.md). This file is the deep dive.
 
 **Why this is tractable (verified in source, not assumed):**
 - The WiPhone LoRa daughterboard is a **HopeRF RFM95W = Semtech SX1276**, which Meshtastic
@@ -17,88 +20,111 @@ replacing the stock proprietary point-to-point LoRa messaging.
   - `WiPhone.ino:1830` `lora.send_message(msg->getOtherUri(), msg->getMessageText());`
   - RX stores via `gui.flash.messages.saveMessage(text, "LORA:<hex>", ...)` and the UI
     already routes `LORA:` addresses (`GUI.cpp` 6798–6984).
-- WiPhone node IDs are already 32-bit MAC-derived, so they map 1:1 onto Meshtastic
-  `NodeNum`s and the existing `LORA:%X` address format is reused unchanged.
+- WiPhone node IDs are already 32-bit MAC-derived (`chipId`), so they map 1:1 onto
+  Meshtastic `NodeNum`s and the existing `LORA:%X` address format is reused unchanged.
 
 ---
 
-## The wire format we're matching (all verified against meshtastic/firmware master)
+## The wire format we're matching (verified against meshtastic/firmware master)
 
 | Layer | Value (US LongFast default) | Source |
 |---|---|---|
-| Frequency | **906.875 MHz** (slot 20) | RadioInterface.cpp freq calc + docs |
+| Frequency | **906.875 MHz** (slot 20 = djb2("LongFast") % 104) | RadioInterface.cpp freq calc |
 | Bandwidth / SF / CR | **250 kHz / SF11 / 4:5** | LongFast preset |
 | Sync word | **0x2B** | all Meshtastic nets |
-| Preamble | 16 | RadioInterface |
+| Preamble | 16 symbols | RadioInterface |
 | Header (16 B, packed, LE) | `to,from,id` u32 + `flags,channel,next_hop,relay_node` u8 | RadioInterface.h `PacketHeader` |
-| `flags` | hop_limit in bits[0..2] (use 3) | PACKET_FLAGS_HOP_LIMIT_MASK |
+| `flags` | hop_limit[0..2], want_ack[3], via_mqtt[4], hop_start[5..7] | PACKET_FLAGS_* masks |
 | `channel` | **0x08** = xorHash("LongFast") ^ xorHash(PSK) | Channels.cpp generateHash |
 | Encryption | **AES-128-CTR** | CryptoEngine |
 | Key (default "AQ==") | `d4 f1 bb 3a 20 29 07 59 f0 bc ff ab cf 4e 69 01` | Channels.cpp defaultpsk |
 | Nonce (16 B) | `packetId(8 LE) ‖ fromNode(4 LE) ‖ counter(4=0)` | CryptoEngine::initNonce |
-| Payload | `Data` protobuf `{portnum=1, payload=<utf8>}`, encrypted | mesh.proto / portnums.proto |
+| Payload | `Data` protobuf, encrypted | mesh.proto / portnums.proto |
 
-For a text message the `Data` protobuf is just: `08 01 12 <len> <utf8 bytes>` — so it's
-hand-rolled and **nanopb is not needed**.
+Protobufs are hand-rolled (**no nanopb**) — the transport speaks exactly three:
 
----
+| Message | Port | Encoding used |
+|---|---|---|
+| Text | 1 | `Data{portnum=1, payload=<utf8>, bitfield=OK_TO_MQTT}` |
+| NodeInfo | 4 | `Data{portnum=4, payload=User{id,long,short,hw_model=PRIVATE_HW}}` |
+| ACK/NAK | 5 | `Data{portnum=5, payload=Routing{error_reason}, request_id=<id>}` |
 
-## Phases
-
-### Phase 0 — hardware sanity (Nick, ~20 min, no code)
-- Confirm the **915 MHz LoRa daughterboard (RFM95W)** is present and seated (the bare
-  WiPhone is WiFi-only). Confirm his T-Deck is on **US / LongFast / default channel**.
-
-### Phase 1 — migrate WiPhone firmware Arduino IDE → PlatformIO/VS Code
-Prerequisite, not polish: you can't manage RadioLib + build flags sanely in Arduino IDE.
-- Use the provided `platformio.ini`. Move sources into `src/`, rename `WiPhone.ino →
-  src/main.cpp`, add `#include <Arduino.h>`, add function prototypes where `.ino` implicit
-  ordering was relied on. Move `data/` for SPIFFS. **Deliverable: stock firmware builds &
-  boots unchanged in PlatformIO.** (Migration gotchas enumerated in `platformio.ini`.)
-
-### Phase 2 — swap the radio stack (THIS IS DONE — see `lora.h` / `lora.cpp`)
-Drop-in replacement of the `Lora` class internals: RadioHead → RadioLib SX1276, stock
-protocol → Meshtastic packets (header + encrypted Data protobuf). Public API identical, so
-no other file changes. Covers TX (`send_message`) and RX (`loop`) of **text messages** on
-the default channel, broadcast + direct.
-
-### Phase 3 — on-air bring-up (Nick + Claude, iterative — the real loop)
-Flash, then verify against the T-Deck. Expected checkpoints:
-1. WiPhone boots, serial shows `Meshtastic LoRa up: node=0x… ch=0x08 906.875MHz SF11`.
-2. Send from WiPhone → appears on the T-Deck as a message from a new node.
-3. Send from T-Deck (broadcast) → lands in the WiPhone Messages screen.
-This is where the physical loop lives: if nothing arrives, the usual suspects are
-frequency/region, the channel-hash byte, or SPI pin mapping — all isolated in `lora.cpp`
-constants. Budget a few flash→test rounds.
-
-### Phase 4 — mesh niceties (optional, after texting works)
-- Show sender short-names (needs the `NodeInfo` portnum, portnum=4) instead of raw hex.
-- Multi-hop relay (rebroadcast decremented-hop packets) to be a full relay node, not just
-  an endpoint.
-- ACKs / delivery confirmation (want_ack flag + routing app).
-- Position/GPS if a GPS daughterboard is attached.
+The RX-side `Data` walker skips unknown fields by wire type, so emoji tapbacks,
+reply_id, PKI markers etc. from current firmware parse cleanly instead of crashing
+the decode.
 
 ---
 
-## Honest status & the couple of real unknowns (not hedging — these are the things
-## only on-hardware testing can close)
+## Status by phase
 
-- **DONE:** full protocol implementation, compile-ready, wire-format-correct by
-  construction (constants pulled from current Meshtastic source).
-- **RX interrupt API:** RadioLib pinned to 6.x → `setPacketReceivedAction`. If you use an
-  older RadioLib, it's `setDio0Action(fn, RISING)`. (Noted inline.)
-- **DIO1 / RST not wired on the WiPhone** (`RFM95_RST=-1`, no DIO1 pin). Basic TX/RX only
-  needs DIO0, which *is* wired (GPIO38). Advanced RadioLib timeouts that want DIO1 aren't
-  used here. Low risk, but the one genuinely hardware-dependent thing to watch on first RX.
-- **Multi-block CTR counter:** short texts are a single AES block (order-independent).
-  Longer messages span blocks; mbedtls and Meshtastic both increment the 128-bit counter
-  big-endian from the same initial nonce, so keystreams match — worth an explicit test with
-  a >16-char message.
-- **Footprint:** adds RadioLib (moderate flash); AES is ESP32 hardware via mbedtls (already
-  in the core); protobuf hand-rolled (no nanopb). This fits comfortably alongside the
-  existing SIP/GUI firmware — not the RAM scare it first looked like.
+### ✅ Phase 1 — Arduino IDE → PlatformIO  (DONE, builds green)
+`pio run` compiles the **entire stock firmware + the new transport** into a flashable
+image: `RAM 26.1%, Flash 91.9%` on arduino-esp32 1.0.6 (`espressif32@3.5.0` — same core
+era as the "WiPhone by ESP32" v0.14 board package; the code uses 1.x APIs like
+`SYSTEM_EVENT_*` and legacy I2S, so don't bump the platform casually).
+The only migration fixes needed, both in `platformio.ini`:
+- `build_unflags = -Werror=reorder` (Arduino IDE built with warnings suppressed;
+  the PIO core build script forces this warning to an error and the stock GUI trips it)
+- `min_spiffs.csv` partitions (fits the 1.8 MB app + OTA + SPIFFS on any 4 MB flash;
+  `partitions-wiphone-16mb.csv` provided for boards with the full 16 MB chip)
 
-## Files in this kit
-- `lora.h`, `lora.cpp` — the Meshtastic-speaking drop-in `Lora` class (Phase 2, done).
-- `platformio.ini` — the VS Code/PlatformIO project + migration notes (Phase 1).
-- `PLAN.md` — this file.
+### ✅ Phase 2 — Meshtastic transport (DONE + adversarially reviewed)
+Drop-in `Lora` class rewrite: RadioHead → RadioLib SX1276 on real hardware HSPI,
+stock magic-number protocol → Meshtastic packets. Public API identical; zero changes
+outside `lora.h` / `lora.cpp`.
+
+**Vet pass results** — the first draft claimed "compile-ready"; a line-by-line review
+against RadioLib's API and the stock call sites found and fixed **three real bugs**
+before any hardware was touched:
+1. `radio->readData()` returns a **status code**, not a length — the draft treated 0
+   (success) as "no data", so RX would never have delivered a single message. Length
+   now comes from `getPacketLength()`.
+2. The GUI strips the `LORA:` prefix before queueing an outgoing message
+   (`GUI.cpp:6969`), so the draft's `strchr(to, ':')` parse never matched — **every DM
+   would have silently gone out as a broadcast**. Now parses bare hex, tolerates both.
+3. `extern NtpClock ntpClock` — the class is `Clock` (`clock.h:136`). Wouldn't compile.
+
+Plus hardening the draft lacked: TxDone-vs-RxDone IRQ disambiguation (DIO0 is shared),
+duplicate-packet dedup, current limit raised for the +20 dBm PA (stock ran RadioHead
+level 23; default OCP of 60 mA would brown the PA_BOOST rail).
+
+### ✅ Phase 4 — mesh citizenship (DONE, pulled forward)
+Originally "later polish", but each is 20–80 lines once the packet plumbing exists,
+and together they're the difference between "science project" and "a node you'd
+actually hunt with":
+- **NodeInfo** broadcast on boot + every 3 h + introduce-on-first-contact + reply to
+  `want_response` — the WiPhone shows up *named* on every node list
+- **ACKs**: responds to `want_ack` DMs (incl. re-ACK of duplicates when our ACK was
+  lost), so senders get delivery checkmarks
+- **Reliable DMs**: `want_ack` + retransmit ×2 with backoff; cancels on ACK, NAK, or
+  hearing a relay carry the packet (implicit ACK, matches ReliableRouter semantics)
+- **Managed-flood relay**: rebroadcasts others' packets (hop-1, random 0.3–1.3 s
+  stagger, `relay_node` stamped) — including foreign-channel traffic, which relays
+  forward without decrypting. `MESH_RELAY 0` opts out.
+- **Dedup**: 32-entry (from,id) ring — flooded copies never reach the Messages UI
+- **Node DB**: 16 names learned from NodeInfo, used in logs (`Mesh RX text from
+  Nick-TDeck …` instead of hex)
+
+### 🔜 Phase 3 — on-air bring-up (Nick + hardware — the only remaining phase)
+Flash, then verify against the T-Deck (checklist in README-MESHTASTIC.md). The honest
+unknowns that only hardware can close, in likelihood order:
+1. **First RX** — DIO0 (GPIO38) is the only wired radio interrupt (no RST, no DIO1).
+   TX/RX needs only DIO0, but this is the untested seam.
+2. **TX at +20 dBm** — if the phone browns out on send, drop `MESH_TXPOWER` to 17.
+3. **Multi-block CTR** — messages >16 chars exercise counter continuation; mbedtls and
+   Meshtastic both increment the counter big-endian from the same nonce, verified in
+   both sources, worth one explicit long-message test.
+
+### Later (documented, deliberately not built)
+PKI DMs (2.5+ public-key encryption — peers fall back to channel-key DMs
+automatically), position/GPS, telemetry, traceroute, MQTT, a "Mesh Nodes" WiPhone app
+fed by the node DB. The `Data` walker + `buildPacket()` make each a small add.
+
+---
+
+## Files
+- `WiPhone/lora.h`, `WiPhone/lora.cpp` — the Meshtastic transport (the whole change)
+- `platformio.ini` — build config (Arduino IDE no longer needed)
+- `partitions-wiphone-16mb.csv` — optional full-flash layout
+- `README-MESHTASTIC.md` — quickstart / bring-up / knobs
+- `MESHTASTIC-PLAN.md` — this file

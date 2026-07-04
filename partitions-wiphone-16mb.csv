@@ -1,0 +1,14 @@
+# WiPhone 16 MB flash layout — 2 OTA app slots + 4 MB SPIFFS (stock-sized
+# message/config storage per WiPhone/INTERNAL_FLASH.txt).
+# Enable in platformio.ini:
+#   board_build.partitions = partitions-wiphone-16mb.csv
+#   board_upload.flash_size = 16MB
+# Only if your board really has 16 MB — check the esptool "flash size" line
+# during upload, or run: pio pkg exec -- esptool.py flash_id
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x300000,
+app1,       app,  ota_1,    0x310000, 0x300000,
+spiffs,     data, spiffs,   0x610000, 0x400000,
+coredump,   data, coredump, 0xA10000, 0x10000,
